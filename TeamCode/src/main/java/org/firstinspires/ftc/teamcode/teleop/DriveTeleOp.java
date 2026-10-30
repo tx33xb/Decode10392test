@@ -16,7 +16,7 @@ import org.firstinspires.ftc.robotcore.external.navigation.AngleUnit;
  *
  * Left stick            : move (forward = away from driver, regardless of robot heading)
  * Right stick left/right: turn left / right (heading is held when released)
- * Share / Back button   : reset "forward" to the direction the robot is facing
+ * Right stick click    : reset "forward" to the direction the robot is facing
  * Hold left trigger     : precision mode (slow)
  */
 @TeleOp(name = "Drive TeleOp", group = "Competition")
@@ -66,14 +66,43 @@ public class DriveTeleOp extends OpMode {
     // Fraction of normal speed while precision mode is held.
     private static final double PRECISION_SCALE = 0.3;
 
+    // How fast drive speed may rise / fall, in full-stick per second (3.0 = 0 to full in 0.33 s).
+    // Sudden power changes make the rollers slip, which twists and slides the robot.
+    // Lower for less slip, raise if the robot feels sluggish.
+    private static final double ACCEL_RATE = 3.0;
+    private static final double DECEL_RATE = 6.0;
+
+    // ---------- Drift trims ----------
+    // Constant corrections for this robot's own pull, so it drives straight even without heading hold.
+    // Tune on "No Heading Hold" in normal mode, full stick, watching the °/s next to Heading:
+    //   driving forward, robot turns left (°/s positive)  -> raise FORWARD_TURN_TRIM; turns right -> lower it.
+    //   strafing right,  robot turns left (°/s positive)  -> raise STRAFE_TURN_TRIM;  turns right -> lower it.
+    //   strafing right,  robot creeps forward             -> lower STRAFE_FORWARD_TRIM; creeps back -> raise it.
+    // Change by about 0.02 at a time.
+    private static final double FORWARD_TURN_TRIM   = 0.0;
+    private static final double STRAFE_TURN_TRIM    = 0.0;
+    private static final double STRAFE_FORWARD_TRIM = 0.0;
+
     // ---------- Heading hold ----------
 
-    // Turn power per degree of error. Raise if the robot drifts, lower if it wobbles.
-    private static final double HEADING_KP       = 0.025;
+    // Turn values below are before MAX_POWER scaling (actual motor power = value * MAX_POWER).
+    // Turn power per degree of error. Raise if the robot still rotates while driving, lower if it wobbles.
+    private static final double HEADING_KP       = 0.05;
+    // Turn power per deg/s of rotation, pushing against rotation the moment it starts (before error builds).
+    // Raise if it overshoots/wobbles back and forth.
+    private static final double HEADING_KD       = 0.003;
+    // Extra turn power added whenever the error is outside the tolerance, to overcome wheel friction
+    // so even a 1-2° error gets corrected instead of being too weak to move the robot.
+    private static final double HEADING_KS       = 0.06;
+    // Errors smaller than this (degrees) count as on target, so the robot doesn't buzz in place.
+    private static final double HEADING_TOLERANCE = 0.5;
     // Most turn power heading hold may use to correct.
-    private static final double HEADING_MAX_TURN = 0.4;
-    // Wait (s) after releasing the turn stick so the robot finishes turning before the heading is locked.
-    private static final double HEADING_LOCK_DELAY = 0.25;
+    private static final double HEADING_MAX_TURN = 0.5;
+    // After the turn stick is released, the heading locks once the robot spins slower than this (deg/s),
+    // so it locks where the robot actually stops instead of snapping back to where it was mid-turn.
+    private static final double HEADING_LOCK_RATE = 15.0;
+    // Lock anyway after this long (s), in case the robot keeps rotating (e.g. being pushed).
+    private static final double HEADING_LOCK_TIMEOUT = 0.6;
 
     private DcMotor frontLeft, frontRight, backLeft, backRight;
     private IMU imu;
@@ -83,6 +112,11 @@ public class DriveTeleOp extends OpMode {
     private final ElapsedTime sinceTurn = new ElapsedTime();
 
     private boolean lastResetButton = false;
+
+    // Ramped drive command (field frame), and time since the last loop for ramping.
+    private double rampedForward = 0.0;
+    private double rampedStrafe  = 0.0;
+    private final ElapsedTime loopTimer = new ElapsedTime();
 
     @Override
     public void init() {
@@ -117,12 +151,13 @@ public class DriveTeleOp extends OpMode {
         imu.resetYaw();
         targetHeading = 0.0;
         headingLocked = true;
+        loopTimer.reset();
     }
 
     @Override
     public void loop() {
-        // Reset field-centric forward. Kept off the sticks so pushing the turn stick can't reset it by accident.
-        boolean resetButton = gamepad1.back;
+        // Reset field-centric forward.
+        boolean resetButton = gamepad1.right_stick_button;
         if (resetButton && !lastResetButton) {
             imu.resetYaw();
             targetHeading = 0.0;
@@ -131,6 +166,7 @@ public class DriveTeleOp extends OpMode {
         lastResetButton = resetButton;
 
         double heading = imu.getRobotYawPitchRollAngles().getYaw(AngleUnit.DEGREES);
+        double yawRate = imu.getRobotAngularVelocity(AngleUnit.DEGREES).zRotationRate;
 
         double scale = gamepad1.left_trigger > PRECISION_TRIGGER_THRESHOLD ? PRECISION_SCALE : 1.0;
 
@@ -147,26 +183,40 @@ public class DriveTeleOp extends OpMode {
             strafe  = driveSpeed * Math.sin(Math.toRadians(stickAngle));
         }
 
+        double dt = loopTimer.seconds();
+        loopTimer.reset();
+        rampedForward = ramp(rampedForward, forward, dt);
+        rampedStrafe  = ramp(rampedStrafe,  strafe,  dt);
+        forward = rampedForward;
+        strafe  = rampedStrafe;
+
         double turn = Math.copySign(shapeInput(Math.abs(gamepad1.right_stick_x)), gamepad1.right_stick_x) * scale;
 
         // Heading hold
         if (turn != 0.0) {
             headingLocked = false;
             sinceTurn.reset();
-        } else if (!headingLocked && sinceTurn.seconds() > HEADING_LOCK_DELAY) {
+        } else if (!headingLocked
+                && (Math.abs(yawRate) < HEADING_LOCK_RATE || sinceTurn.seconds() > HEADING_LOCK_TIMEOUT)) {
             targetHeading = heading;
             headingLocked = true;
         }
         if (headingHoldEnabled() && headingLocked) {
             // Heading is CCW-positive; positive turn power turns clockwise.
             double error = AngleUnit.normalizeDegrees(targetHeading - heading);
-            turn = Range.clip(-error * HEADING_KP, -HEADING_MAX_TURN, HEADING_MAX_TURN);
+            double correction = -error * HEADING_KP + yawRate * HEADING_KD;
+            if (Math.abs(error) > HEADING_TOLERANCE) correction += Math.copySign(HEADING_KS, -error);
+            turn = Range.clip(correction, -HEADING_MAX_TURN, HEADING_MAX_TURN);
         }
 
         // Field-centric: rotate stick input by the robot's heading
         double headingRad = Math.toRadians(heading);
         double robotStrafe  = (strafe * Math.cos(-headingRad) - forward * Math.sin(-headingRad)) * STRAFE_MULTIPLIER;
         double robotForward =  strafe * Math.sin(-headingRad) + forward * Math.cos(-headingRad);
+
+        // Drift trims, in the robot's own frame since the pull comes from the robot itself.
+        turn         += FORWARD_TURN_TRIM * robotForward + STRAFE_TURN_TRIM * robotStrafe;
+        robotForward += STRAFE_FORWARD_TRIM * robotStrafe;
 
         // Scale down so no wheel exceeds full power while keeping the motion ratio.
         double denominator = Math.max(Math.abs(robotForward) + Math.abs(robotStrafe) + Math.abs(turn), 1.0);
@@ -182,7 +232,7 @@ public class DriveTeleOp extends OpMode {
         backRight.setPower(br);
 
         telemetry.addData("Mode", scale < 1.0 ? "PRECISION" : "Normal");
-        telemetry.addData("Heading", "%.1f°", heading);
+        telemetry.addData("Heading", "%.1f°  (%.0f°/s)", heading, yawRate);
         telemetry.addData("Heading Hold", !headingHoldEnabled() ? "DISABLED" : headingLocked ? String.format("ON (target %.1f°)", targetHeading) : "off");
         telemetry.addData("FL / FR", "%.2f  %.2f", fl, fr);
         telemetry.addData("BL / BR", "%.2f  %.2f", bl, br);
@@ -211,6 +261,13 @@ public class DriveTeleOp extends OpMode {
         if (push < DEADZONE) return 0.0;
         double rescaled = (push - DEADZONE) / (1.0 - DEADZONE);
         return Math.pow(rescaled, INPUT_EXPONENT);
+    }
+
+    /** Moves current toward target, no faster than ACCEL_RATE when speeding up or DECEL_RATE when slowing down. */
+    private static double ramp(double current, double target, double dt) {
+        boolean slowingDown = Math.abs(target) < Math.abs(current) || target * current < 0.0;
+        double maxStep = (slowingDown ? DECEL_RATE : ACCEL_RATE) * dt;
+        return current + Range.clip(target - current, -maxStep, maxStep);
     }
 
     /**
