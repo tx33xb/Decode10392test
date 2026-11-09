@@ -14,7 +14,7 @@ import org.firstinspires.ftc.robotcore.external.navigation.UnnormalizedAngleUnit
 import org.firstinspires.ftc.teamcode.pedro.Constants;
 
 /**
- * Field-centric mecanum drive with heading hold, line hold and precision mode.
+ * Field-centric mecanum drive with heading hold and line hold, plus the intake.
  * Heading and position come only from the Pinpoint odometry computer (and its own IMU); the Control Hub's
  * built-in IMU is never used. Pinpoint setup and the correction gains come from the Pedro autotune results
  * in {@link Constants}.
@@ -22,7 +22,8 @@ import org.firstinspires.ftc.teamcode.pedro.Constants;
  * Left stick            : move in a straight line (forward = away from driver, regardless of robot heading)
  * Right stick left/right: turn left / right (heading is held when released)
  * Right stick click    : reset "forward" to the direction the robot is facing
- * Hold left trigger     : precision mode (slow)
+ * Hold left trigger     : run intake forward
+ * Hold right trigger    : run intake backward
  */
 @TeleOp(name = "Drive TeleOp", group = "Competition")
 public class DriveTeleOp extends OpMode {
@@ -34,6 +35,7 @@ public class DriveTeleOp extends OpMode {
     private static final String FRONT_RIGHT_NAME = "front_right_motor";
     private static final String BACK_LEFT_NAME   = "back_left_motor";
     private static final String BACK_RIGHT_NAME  = "back_right_motor";
+    private static final String INTAKE_NAME      = "intake"; // Expansion Hub motor port 0
     // Pinpoint (Control Hub I2C bus 1) name, type, offsets and directions are read from
     // Constants.localizerConfig, so re-running the Pedro tuner and pasting the new Constants updates this too.
 
@@ -50,8 +52,8 @@ public class DriveTeleOp extends OpMode {
     // Line hold holds the snapped direction.
     private static final double STRAIGHT_SNAP_DEG = 30.0;
 
-    // How far the left trigger must be pressed to enter precision mode.
-    private static final double PRECISION_TRIGGER_THRESHOLD = 0.5;
+    // How far a trigger must be pressed to run the intake.
+    private static final double INTAKE_TRIGGER_THRESHOLD = 0.1;
 
     // Rumble length (ms) when field-centric forward is reset.
     private static final int RESET_RUMBLE_MS = 200;
@@ -65,8 +67,10 @@ public class DriveTeleOp extends OpMode {
     // Highest power any drive motor is given (1.0 = full power).
     private static final double MAX_POWER = 0.5;
 
-    // Fraction of normal speed while precision mode is held.
-    private static final double PRECISION_SCALE = 0.3;
+    // ---------- Intake ----------
+
+    // Intake motor power while a trigger is held (left = forward, right = backward).
+    private static final double INTAKE_POWER = 1.0;
 
     // ---------- Heading hold ----------
 
@@ -135,6 +139,7 @@ public class DriveTeleOp extends OpMode {
     private static final double LINE_MAX_INTEGRAL = 2.0;
 
     private DcMotor frontLeft, frontRight, backLeft, backRight;
+    private DcMotor intake;
     private GoBildaPinpointDriver pinpoint;
 
     // Pinpoint heading (deg) that counts as field "forward"; set at start and by the reset button.
@@ -170,6 +175,10 @@ public class DriveTeleOp extends OpMode {
             motor.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
             motor.setZeroPowerBehavior(DcMotor.ZeroPowerBehavior.BRAKE);
         }
+
+        intake = hardwareMap.get(DcMotor.class, INTAKE_NAME);
+        intake.setDirection(DcMotorSimple.Direction.FORWARD);
+        intake.setMode(DcMotor.RunMode.RUN_WITHOUT_ENCODER);
 
         String pinpointName = Constants.localizerConfig.name.get();
         pinpoint = hardwareMap.tryGet(GoBildaPinpointDriver.class, pinpointName);
@@ -242,15 +251,19 @@ public class DriveTeleOp extends OpMode {
         double fieldVelStrafe  = -(-vx * Math.sin(offsetRad) + vy * Math.cos(offsetRad));
         double speed = Math.hypot(vx, vy);
 
-        double scale = gamepad1.left_trigger > PRECISION_TRIGGER_THRESHOLD ? PRECISION_SCALE : 1.0;
+        // Intake: runs only while a trigger is held; both held cancel out to stopped.
+        double intakePower = 0.0;
+        if (gamepad1.left_trigger  > INTAKE_TRIGGER_THRESHOLD) intakePower += INTAKE_POWER;
+        if (gamepad1.right_trigger > INTAKE_TRIGGER_THRESHOLD) intakePower -= INTAKE_POWER;
+        intake.setPower(intakePower);
 
-        double turn = Math.copySign(shapeInput(Math.abs(gamepad1.right_stick_x)), gamepad1.right_stick_x) * scale;
+        double turn = Math.copySign(shapeInput(Math.abs(gamepad1.right_stick_x)), gamepad1.right_stick_x);
         boolean driverTurning = turn != 0.0;
 
         // Left stick: speed comes from how far it's pushed, direction from its angle.
         double stickForward = -gamepad1.left_stick_y;
         double stickStrafe  =  gamepad1.left_stick_x;
-        double driveSpeed   = shapeInput(Math.hypot(stickForward, stickStrafe)) * scale;
+        double driveSpeed   = shapeInput(Math.hypot(stickForward, stickStrafe));
         double forward = 0.0;
         double strafe  = 0.0;
         if (driveSpeed > 0.0) {
@@ -371,7 +384,7 @@ public class DriveTeleOp extends OpMode {
         frontRight.setPower(fr);
         backRight.setPower(br);
 
-        telemetry.addData("Mode", scale < 1.0 ? "PRECISION" : "Normal");
+        telemetry.addData("Intake", intakePower > 0 ? "FORWARD" : intakePower < 0 ? "BACKWARD" : "off");
         telemetry.addData("Heading", "%.1f°  (%.0f°/s)", heading, yawRate);
         telemetry.addData("Heading Hold", !headingHoldEnabled() ? "DISABLED" : headingLocked ? String.format("ON (target %.1f°)", targetHeading) : "off");
         telemetry.addData("Odometry X / Y", "%.1f  %.1f in  (%s)", x, y, pinpoint.getDeviceStatus());
@@ -387,6 +400,7 @@ public class DriveTeleOp extends OpMode {
         frontRight.setPower(0);
         backLeft.setPower(0);
         backRight.setPower(0);
+        intake.setPower(0);
     }
 
     /** Whether heading hold corrects unwanted rotation. {@link DriveTeleOpNoHeading} turns it off. */
