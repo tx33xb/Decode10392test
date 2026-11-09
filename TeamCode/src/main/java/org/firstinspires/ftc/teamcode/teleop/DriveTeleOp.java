@@ -14,7 +14,6 @@ import org.firstinspires.ftc.robotcore.external.navigation.UnnormalizedAngleUnit
 import org.firstinspires.ftc.teamcode.pedro.Constants;
 
 /**
- * cookie
  * Field-centric mecanum drive with heading hold and line hold, plus the intake.
  * Heading and position come only from the Pinpoint odometry computer (and its own IMU); the Control Hub's
  * built-in IMU is never used. Pinpoint setup and the correction gains come from the Pedro autotune results
